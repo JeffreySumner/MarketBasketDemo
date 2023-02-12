@@ -1,0 +1,194 @@
+---
+title: "Market Basket Demo"
+author: "Jeffrey Sumner"
+date: "February 18, 2019"
+output: pdf_document
+---
+
+# Introduction
+
+## Data
+This data comes from a kaggle competition in 2017. All files are open to the public, particularly those interested in Kaggle competitions. The data competition overview can be found at the following link: <https://www.kaggle.com/c/instacart-market-basket-analysis>.
+
+Data specs of note:
+
+aisles.csv - 134 x 2  
+departments.csv - 21 x 2  
+order_products_prior.csv - 32.4m x 4  
+order_products_train.csv - 1.38m x 4  
+orders.csv - 3.42m x 7  
+products.csv 49.7k x 4  
+
+## Objective
+To find potential product pairings based on order_products_prior and order_products_train.
+
+## Methodology
+*Data collection*: Kaggle created .csv's  
+*Data manipulation*: Extensive use of R's tidyverse package, particularly dplyr to create end-user and dashboard friendly datasets.  
+*Graphics*: ggplot can be used to create beautiful visuals to further showcase the final pairings information; dashboarding tools such as PowerBI and Tableau can be used to create end-user friendly UI
+
+# R Scripting
+
+## Required Libraries
+As mentioned above, tidyverse will be a pivotal package for this analysis as well as multidplyr. multidplyr is a lesser-known package that acts similarly to **parallel**. multidplyr uses multiple cores to make efficient use of the CPU and increase computational speeds.
+```{r message = FALSE}
+# libraries required to perform analysis
+library(tidyverse)
+library(multidplyr)
+library(data.table)
+library(writexl)
+
+# initialize clusters for multidplyr functionality
+cluster <- get_default_cluster()
+# add required packages to each cluster that are used in conjunction with multidplyr
+cluster_library(cluster,"tidyverse")
+options(scipen = 999)
+```
+
+## Reading and Cleaning the Data
+Next up is reading in the files from Kaggle. The files are stored on my local machine, in this case, inside of my project folder. I prefer to duplicate as little code as possible, so I loop through each file and assign them to data.frames
+```{r}
+
+
+# read in data
+# fread is located in the data.table package
+# it is an extremely fast way to read in data
+for(i in list.files(pattern = ".csv",full.names = FALSE)){
+  assign(gsub(".csv","",i),
+         fread(i,
+               data.table = FALSE)
+         )
+}
+
+
+# Here I combine the prior and train data to complete the full dataset
+order_products <- rbind(order_products__prior,order_products__train)
+rm(order_products__prior)
+rm(order_products__train)
+gc()
+
+# For this demo I wanted to focus only on Yogurt data.
+# I look for any products that contain "Yogurt"" in the products file
+products_yogurt <- products %>%
+  mutate(contains_yogurt = str_detect(product_name,"Yogurt")) %>%
+  filter(contains_yogurt)
+
+# filter non-yogurt products from the data
+order_products_yogurt <- order_products %>%
+  filter(product_id %in% products_yogurt$product_id)
+```
+
+## Create Pairing Data
+The last major portion of this analysis is to create the pairing data. To do this, we will perform very simple, yet powerful data maniuplation. This manipulation will allow us to create pair combinations which can then be used to create visuals.
+```{r}
+# Create pairs dataset via data manipulations
+yogurt_pairs <- order_products_yogurt %>%
+  select(-add_to_cart_order,-reordered) %>%
+  # Partition replaces generic group_by
+  # This significantly increases computation speed
+  partition(order_id) %>%
+  # str_c in combination with partition creates
+  # A new column with all possible combinations of a particular order
+  mutate(product_id_c = str_c(product_id,collapse = ","),
+         counts = length(unique(product_id))) %>%
+  # Collect is always used after partition to
+  # "Collect" the data off the cores used
+  collect() %>%
+  ungroup() %>%
+  # Maxlen is created to determine the maximum number of new
+  # Columns needed to finalize the manipulation
+  mutate(maxlen = max(counts)) %>% 
+  # Separate spreads our product_id_c into multiple columns based
+  # on the ","
+  # Some products may pair only once or twice so missing values will fill
+  # Any particular pairings that do not need the full maximum
+  # Number of columns
+  separate(product_id_c,
+           into = paste("V",
+                        1:unique(.$maxlen)
+                        ),
+           sep = ",") %>%
+  # finally we gather the newly created V columns
+  # then filter out the unwanted NA's
+  gather(pair_num,pair_id,-order_id,-product_id,-counts,-maxlen) %>%
+  mutate(pair_id = as.numeric(pair_id)) %>%
+  filter(!pair_id %in% NA)
+glimpse(yogurt_pairs)
+head(yogurt_pairs,25)
+```
+
+## The Final Touches
+The hard part is over! The data has been cleaned and transformed to fit our needs. Now all that remains is to create product references for the original product as well as the newly created pairing product.
+```{r}
+# reference for original product
+product_id_ref <- products_yogurt %>%
+  select(product_id, product_name_1 = product_name,
+         aisle_id_1 = aisle_id, department_id_1 = department_id)
+# reference for paired product
+pair_id_ref <- products_yogurt %>%
+  select(product_id, product_name_2 = product_name,
+         aisle_id_2 = aisle_id, department_id_2 = department_id)
+# join the references back to the yogurt_pairs
+# remove any pairs that are same item pairs
+yogurt_pairs_clean <- yogurt_pairs %>%
+  left_join(product_id_ref, by = c("product_id" = "product_id")) %>%
+  left_join(pair_id_ref, by = c("pair_id" = "product_id")) %>%
+  mutate(same_id = ifelse(product_id == pair_id,TRUE,FALSE)) %>%
+  filter(!same_id)
+
+```
+
+# Conclusions
+
+## How to use the Data
+Now that we have finished all of the heavy lifting, how can this data be used? Below we created a table of counts for each pairing. These can also be created in PowerBI, Tableau, or any other BI software as needed.
+```{r}
+table_counts <- yogurt_pairs_clean %>%
+  group_by(product_id,product_name_1,pair_id,product_name_2) %>%
+  summarize(orders_together = n_distinct(order_id)) %>%
+  arrange(desc(orders_together)) %>%
+  ungroup()
+
+head(table_counts,10)
+```
+
+## Additional Analysis
+We can extend the work in R by adding in order values for each product to determine probabilites of a pair occurring. To do this, we will first create a count for each order.
+```{r}
+orders_by_product <- order_products_yogurt %>%
+  group_by(product_id) %>%
+  summarize(order_counts = n_distinct(order_id,na.rm = TRUE)) %>%
+  ungroup()
+```
+
+Now we have total orders for each product. We need to add this back to our counts table. This must be done twice to account for both the original product and the paired product. We will also go ahead and add in the total number of orders in the entire dataset to calculate additional metrics.
+```{r}
+total_orders <- length(unique(order_products_yogurt$order_id))
+
+table_counts_additions <- table_counts %>%
+  left_join(orders_by_product %>%
+              select(product_id,order_counts_1 = order_counts),by = "product_id") %>%
+    left_join(orders_by_product %>%
+              select(product_id,order_counts_2 = order_counts),by = c("pair_id"="product_id")) %>%
+  mutate(total_orders = total_orders)
+glimpse(table_counts_additions)
+```
+
+Looking at the **total_orders** column we see that there were 837k unique orders of yogurt. When looking at **orders_together**, i.e the number of orders in which a given pair occurs, compared to **total_orders** we see that there is a very low chance that a given pair occurs. The first set of pairs that we see are the most ordered of all the pairs and this still equals 9565/837039 or roughly 1.1%. Looking at this value alone would be insufficient. We must dig a little deeper to fully understand the story. This is why we added in the product_id order counts as well as the pair_id order counts.
+
+Next we will calculate the percent of orders for each product_id and pair_id.
+```{r}
+table_counts_additions <- table_counts_additions %>%
+  mutate(product_name_1_pct = 100*orders_together/order_counts_1,
+         product_name_2_pct = 100*orders_together/order_counts_2)
+head(data.frame(table_counts_additions %>%
+       select(product_name_1,product_name_1_pct,product_name_2,product_name_2_pct)),
+     10
+)
+```
+
+The output above is a little messy, but extremely useful. Now we know that out of ALL the times **"Total 2% Lowfat Greek Strained Yogurt With Blueberry"** was bought (**21,405 times**) it was **paired with "Total 2% with Strawberry Lowfat Greek Strained Yogurt" 9,565 times**. This tells us that **the pairing occured 44.7% of the time given that the Blueberry was purchased**.
+
+Likewise we can reverse this information. Out of ALL the times **"Total 2% with Strawberry Lowfat Greek Strained Yogurt"** was bought (**30,866 times** in all) it was **paired with "Total 2% Lowfat Greek Strained Yogurt With Blueberry" 9,565 times**. This tells us that **the pairing occurred 30.99% of the time given that the Strawberry was purchased**.
+
+Taking this a step further was much more insightful than stopping at the pairing counts divided by total number of orders. Now we have decisions that can be made. Products can be placed in closer proximity or coupons/digital deals can be created to increase the customer's chance of purchasing a pair of items and therefore, in return, further increasing basket size.
